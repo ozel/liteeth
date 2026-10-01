@@ -221,7 +221,10 @@ Etherbone baselines: same CRG, LEDs and 50MHz `sys` clock, one ECP5 RGMII PHY an
 |-----------------------------------|-----------------------|-------------|------------|-----------------------|---------------------|
 | `add_etherbone`, 8-bit (default)  | 5596 (13%)            | 3004 (7%)   | 1          | 66MHz: fails          | 81MHz               |
 | `add_etherbone`, 32-bit           | 7443 (17%)            | 2875 (7%)   | 0          | 131MHz                | 49MHz: fails        |
-| 3-port switch SoC                 | 13917 (32%)           | 5411 (12%)  | 11 (10%)   | 151-159MHz            | 53.6-55.6MHz        |
+| 3-port switch SoC (default)       | 13917 (32%)           | 5411 (12%)  | 11 (10%)   | 151-159MHz            | 53.6-55.6MHz        |
+| switch, `--egress-store-and-forward` | 14095 (32%)        | 5563 (13%)  | 17 (16%)   | 156-172MHz            | 57.0MHz             |
+| switch, `--with-dynamic-link` (+ store-and-forward) | 13865 (32%) | 5605 (13%) | 17 (16%) | 145-162MHz        | 52.6MHz             |
+| switch, `--with-dynamic-link --no-egress-store-and-forward` | 13645 (31%) | 5443 (12%) | 11 (10%) | 143-157MHz | 56.7MHz           |
 
 Compared with the 32-bit baseline, which has the same host stack width, the switch SoC uses 1.9x
 the LUTs (+6.5k), 1.9x the FFs (+2.5k) and 11 more block RAMs; 2.5x the LUTs of the 8-bit
@@ -229,6 +232,10 @@ default. The switch core alone (`LiteEthSwitch`, 3 ports, without CSRs) synthesi
 128 CCU2C, 105 TRELLIS_DPR16X4, 1238 FFs and the 11 block RAMs: three 4KiB ingress buffers (3
 each) and the 256-entry MAC table (2). The rest of the difference is the second PHY with its MAC
 core (32-bit FCS generation and checking) and the statistics/control CSRs (17 32-bit counters).
+
+The options cost little: 10/100Mbps support (`with_dynamic_link`) adds about 30 FFs (LUT
+differences of a few hundred are place-and-route noise), store-and-forward egresses on the two PHY
+ports 6 block RAMs (3 per 4KiB buffer) and about 150 FFs. All combinations meet timing.
 
 Neither baseline meets timing as configured: with 8-bit data width, LiteX clocks the whole
 UDP/IP + Etherbone stack from the 125MHz RGMII RX clock (critical path in the IP TX checksum and
