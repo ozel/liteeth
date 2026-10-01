@@ -65,8 +65,13 @@ class SwitchSoC(SoCMini):
             aging_time  = aging_time,
         )
         for n, phy in enumerate(phys):
-            # Preamble/FCS/padding in sys: only width conversion and CDC run at 125MHz.
-            switch.add_phy(n, phy, cd=f"eth{n}", with_sys_datapath=True)
+            # Preamble/FCS/padding in sys: only width conversion and CDC run at 125MHz. 16-word
+            # CDCs are plenty (32-bit words at 50MHz vs 8-bit at 125MHz) and ease 125MHz timing.
+            switch.add_phy(n, phy, cd=f"eth{n}",
+                with_sys_datapath = True,
+                tx_cdc_depth      = 16,
+                rx_cdc_depth      = 16,
+            )
 
         # Internal Host: UDP/IP + ICMP + Etherbone -------------------------------------------------
         self.ethcore = ethcore = LiteEthSwitchUDPIPCore(
