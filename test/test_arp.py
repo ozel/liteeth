@@ -13,7 +13,7 @@ from test.stream_helpers import *
 
 from liteeth.common import *
 from liteeth.mac import LiteEthMAC
-from liteeth.core.arp import LiteEthARP
+from liteeth.core.arp import LiteEthARP, LiteEthARPCache
 
 from test.model import phy, mac, arp
 
@@ -64,3 +64,36 @@ class TestARP(unittest.TestCase):
                     "eth_tx" : 10,
                 }
                 run_simulation(dut, generators, clocks, vcd_name="sim.vcd")
+
+class TestARPCache(unittest.TestCase):
+    def test_lookup_returns_matching_entry(self):
+        # Each IP must resolve to its own MAC, wherever its entry sits in the cache.
+        dut   = LiteEthARPCache(entries=4, clk_freq=1e6)
+        peers = {0xc0a80164: 0x020000000010, 0xc0a80165: 0x020000000011, 0xc0a80166: 0x020000000012}
+        results = {}
+
+        def generator():
+            # Wait for the initial clear.
+            for _ in range(8):
+                yield
+            for ip, mac in peers.items():
+                yield dut.update.valid.eq(1)
+                yield dut.update.ip_address.eq(ip)
+                yield dut.update.mac_address.eq(mac)
+                yield
+                while not (yield dut.update.ready):
+                    yield
+                yield dut.update.valid.eq(0)
+                yield
+            for ip in reversed(list(peers)):
+                yield dut.request.valid.eq(1)
+                yield dut.request.ip_address.eq(ip)
+                yield
+                while not (yield dut.response.valid):
+                    yield
+                results[ip] = ((yield dut.response.mac_address), (yield dut.response.error))
+                yield dut.request.valid.eq(0)
+                yield
+
+        run_simulation(dut, generator())
+        self.assertEqual(results, {ip: (mac, 0) for ip, mac in peers.items()})

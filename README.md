@@ -60,6 +60,9 @@ Frontend:
   - Etherbone (Wishbone over UDP: Slave or Master support)
   - UDP Streaming.
 
+Switch:
+  - Transparent learning layer-2 switch with PHY and internal ports: [doc/switch.md](doc/switch.md).
+
 [> FPGA Proven
 ---------------
 LiteEth is already used in commercial and open-source designs:

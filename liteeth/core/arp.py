@@ -263,6 +263,8 @@ class LiteEthARPCache(LiteXModule):
            )
         )
         fsm.act("RESPONSE",
+           # Keep reading the matching entry: the response MAC comes from the read port.
+           mem_rd_port.adr.eq(search_count),
            self.request.ready.eq(1),
            self.response.valid.eq(1),
            self.response.error.eq(error),
