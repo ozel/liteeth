@@ -37,20 +37,7 @@ host (ICMP + Etherbone) on the third port: [`bench/colorlight_i9_switch.py`](../
 ### Datapath and allocation
 
 The datapath is `dw` bits wide in the `sys` clock domain: the bandwidth per port and direction is
-`dw*sys_clk_freq`, minus a per-frame overhead (table lookup, allocation) of 5 cycles. With `dw=32`,
-a minimum-size frame takes 20 cycles, unicast or flooded: 400ns at 50MHz, against 672ns on a
-1Gbps wire (64 bytes + preamble + IFG). The overhead overlaps with egress transmission, so every
-port sustains 1Gbps in both directions at once: `TestSwitchLineRate` in `test/test_switch.py`
-feeds each ingress at exactly line rate and drains each egress like a 1Gbps wire (dw=32, 50MHz),
-and checks that nothing is dropped, lost, reordered or corrupted, for 3-port permutation traffic,
-a full-duplex 2-port bridge (64 and 1518-byte frames) and floods. Each ingress then only ever
-holds the frame being stored and forwarded.
-
-With 1Gbps ports this gives the switch a capacity of 2 x 1Gbps per port (full duplex) and a
-forwarding rate of 1.488Mpps per port (64-byte frames), e.g. 6Gbps / 4.46Mpps with 3 ports.
-Congestion (several ingresses towards one egress) is absorbed by the ingress buffers only, then
-frames are dropped. Since each ingress serves its frames in order, a frame waiting for a congested
-egress also delays the ones behind it (head-of-line blocking).
+`dw*sys_clk_freq`, minus a per-frame overhead (table lookup, allocation) of 5 cycles.
 
 An ingress requests all its egress ports at once and an allocator grants them atomically, so a
 flood is transmitted once, in lockstep, to every egress port. Grants never hold-and-wait, so
@@ -63,6 +50,68 @@ while requests to other egress ports proceed in parallel.
 The table is a direct-mapped hash table (`table_depth` entries, XOR-folded MAC address) in block
 RAM, shared by all ports. Each frame costs one lookup and one learn, a few cycles. A new address
 replaces whatever occupied its slot.
+
+## Performance
+
+Figures for the Colorlight i9 configuration: 3 ports, `dw=32`, `sys` at 50MHz, 1Gbps PHYs.
+
+### Throughput and forwarding rate
+
+| Metric                                           | Value                                              |
+|--------------------------------------------------|----------------------------------------------------|
+| Internal bandwidth                               | 1.6Gbps per port and direction (4.8Gbps in total)  |
+| Cost of a 64-byte frame (unicast or flood)       | 20 cycles (15 data words + 5): 400ns, vs 672ns on the wire |
+| Internal forwarding capacity                     | 2.5Mpps per port (7.5Mpps in total)                |
+| MAC table                                        | 3 cycles per lookup/learn: 16.7M lookups/s, shared |
+| Switching capacity (ports x 1Gbps x 2)           | 6Gbps (4Gbps for the two RGMII ports)              |
+| Forwarding rate at line rate (64-byte frames)    | 1.488Mpps per port: 4.46Mpps (2.98Mpps for the RGMII ports) |
+
+The per-frame overhead overlaps with egress transmission, so every port sustains 1Gbps in both
+directions at once, whatever the frame size. `TestSwitchLineRate` in `test/test_switch.py` feeds
+each ingress at exactly line rate (preamble, FCS and IFG included) and drains each egress like a
+1Gbps wire, and checks that nothing is dropped, lost, reordered or corrupted for:
+
+- 3-port permutation traffic (0 -> 1, 1 -> 2, 2 -> 0), 64-byte frames;
+- a full-duplex 2-port bridge (0 <-> 1), 64-byte and 1518-byte frames;
+- floods, 64-byte frames.
+
+In these cases each ingress only ever holds the frame being stored and forwarded. Fed 30% faster
+than its egress drains, the switch drops frames, as expected, and the test reports them.
+
+The internal host port (LiteEth UDP/IP + Etherbone) is fed at line rate by the switch, but the
+host itself processes far less: it is a management port.
+
+### Congestion and latency
+
+- Several ingresses towards one egress (e.g. 2Gbps into a 1Gbps port) are only absorbed by the
+  4KiB ingress buffers (2.7 full-size frames, at most `param_depth` frames), then frames are
+  dropped and counted in `ingress<n>_rx_drops`.
+- Each ingress serves its frames in order: a frame waiting for a congested egress also delays the
+  ones behind it for other egress ports (head-of-line blocking). For all ports saturated with
+  uniformly random destinations, an input-queued switch with 3 ports is limited to about 68%
+  throughput (theoretical figure, not measured here). Bridging and permutation traffic are not
+  affected and run at 100%.
+- Store and forward: latency grows with frame length, at least one frame time (0.5us for 64-byte,
+  12us for 1518-byte frames) plus the pipeline.
+
+### Maximum frame length
+
+Measured on the simulated i9 (PHY0 -> switch -> PHY1, lengths without FCS):
+
+| Frame length    | Result                                                                   |
+|-----------------|--------------------------------------------------------------------------|
+| 60 - 2047 bytes | Forwarded (covers 1518-byte and VLAN-tagged 1522-byte frames).            |
+| 2048 - 2107     | Dropped: see below.                                                      |
+| 2108 - 4095     | Forwarded.                                                               |
+| 4096 and more   | Dropped: frames don't fit the 4KiB ingress buffer (4096 also hits the issue below). |
+
+The 2048 - 2107 gap comes from LiteEth's MAC RX padding checker: its length counter is sized for
+`eth_mtu` (1530 bytes, 11 bits) and wraps, flagging frames whose length modulo 2048 is under 60
+bytes as runts. Such frames reach the switch intact (no CRC errors) and are dropped by the
+ingress. The internal host (LiteEth UDP/IP stack) accepts frames up to `eth_mtu` (1530 bytes).
+
+9000-byte jumbo frames would need `buffer_size=16384` (an estimated 11 block RAMs per ingress
+instead of 3) and a wider length counter in the padding checker.
 
 ## Integration
 
@@ -127,15 +176,36 @@ use LiteEth's ECP5 RGMII PHY at 1Gbps, as litex-boards' `colorlight_i5` target d
 process preamble/FCS/padding in `sys` (`with_sys_datapath=True`, 50MHz) so that only width
 conversion and (16-word) clock domain crossings run at the 125MHz RGMII clocks.
 
-With yosys 0.69 / nextpnr-ecp5 0.11 (LFE5U-45F-6), the SoC uses 31% of the LUTs, 12% of the FFs and
-11 of 108 block RAMs, and meets timing: 151-159MHz on the RGMII clocks (125MHz required) and
-53-55MHz on `sys` (50MHz required), on two placement seeds.
-
 ```sh
 ./bench/colorlight_i9_switch.py --build --load
 ping 192.168.1.50                                    # Internal host, from either port.
 litex_server --udp --udp-ip 192.168.1.50 &           # Then e.g. litex_cli --regs | grep switch
 ```
+
+### Resources and timing
+
+Built with yosys 0.69 / nextpnr-ecp5 0.11 for the LFE5U-45F-6, compared with single-port
+Etherbone baselines: same CRG, LEDs and 50MHz `sys` clock, one ECP5 RGMII PHY and LiteX's
+`add_etherbone()` (LiteEth MAC + UDP/IP + Etherbone, `buffer_depth=16`) with 8-bit (default) or
+32-bit data width. Placement seed 1, plus seed 2 for the switch.
+
+| Design                            | LUTs (`TRELLIS_COMB`) | FFs         | Block RAMs | RGMII clock (125MHz)  | `sys` (50MHz)       |
+|-----------------------------------|-----------------------|-------------|------------|-----------------------|---------------------|
+| `add_etherbone`, 8-bit (default)  | 5596 (13%)            | 3004 (7%)   | 1          | 66MHz: fails          | 81MHz               |
+| `add_etherbone`, 32-bit           | 7443 (17%)            | 2875 (7%)   | 0          | 131MHz                | 49MHz: fails        |
+| 3-port switch SoC                 | 13917 (32%)           | 5411 (12%)  | 11 (10%)   | 151-159MHz            | 53.6-55.6MHz        |
+
+Compared with the 32-bit baseline, which has the same host stack width, the switch SoC uses 1.9x
+the LUTs (+6.5k), 1.9x the FFs (+2.5k) and 11 more block RAMs; 2.5x the LUTs of the 8-bit
+default. The switch core alone (`LiteEthSwitch`, 3 ports, without CSRs) synthesizes to 1990 LUT4,
+128 CCU2C, 105 TRELLIS_DPR16X4, 1238 FFs and the 11 block RAMs: three 4KiB ingress buffers (3
+each) and the 256-entry MAC table (2). The rest of the difference is the second PHY with its MAC
+core (32-bit FCS generation and checking) and the statistics/control CSRs (17 32-bit counters).
+
+Neither baseline meets timing as configured: with 8-bit data width, LiteX clocks the whole
+UDP/IP + Etherbone stack from the 125MHz RGMII RX clock (critical path in the IP TX checksum and
+crossbar); with 32-bit, the stack runs in `sys` and misses 50MHz by a small margin. The switch SoC
+meets timing thanks to the MAC cores' `sys` datapath and 16-word buffered clock domain crossings.
 
 ## Simulation with TAP interfaces
 
@@ -171,6 +241,8 @@ Unit tests of the switch logic: `python3 -m unittest test.test_switch`.
 - No VLANs, spanning tree or flow control (pause frames are forwarded like other multicast).
 - Direct-mapped table: two active addresses hashing to the same slot evict each other, causing
   extra flooding.
+- Frames longer than 4095 bytes, and frames of 2048 - 2107 bytes, are dropped (see
+  [Maximum frame length](#maximum-frame-length)).
 - Head-of-line blocking: an ingress waits for all the egress ports of its head frame. An internal
   port that stops accepting frames eventually stalls the floods towards it.
 - PHY ports run at 1Gbps (the ECP5 RGMII PHY's `with_dynamic_link` would add 10/100Mbps; this
