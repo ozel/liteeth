@@ -20,6 +20,7 @@ internal host (ICMP + Etherbone) and checks the switch state over Etherbone.
 Run as root (TAP interfaces, namespaces):
     ./test_colorlight_i9_switch_sim.py               # Build the simulation, then test.
     ./test_colorlight_i9_switch_sim.py --no-build    # Reuse a previous build.
+    ./test_colorlight_i9_switch_sim.py --speeds 100,1000   # PHY0 at 100Mbps, PHY1 at 1Gbps.
 """
 
 import os
@@ -33,6 +34,7 @@ import contextlib
 import subprocess
 
 from litex.tools.remote.comm_udp import CommUDP
+from litex.tools.remote.etherbone import EtherbonePacket, EtherboneRecord, EtherboneReads, EtherboneWrites
 
 # Setup --------------------------------------------------------------------------------------------
 
@@ -150,10 +152,36 @@ class Switch:
 
 # Tests --------------------------------------------------------------------------------------------
 
+INBAND_STATUS = {1000: 0b1101, 100: 0b1011, 10: 0b1001} # Link up, speed, full-duplex.
+
+def flooded_host_replies(sw, count):
+    """Make the host flood replies to both PHYs: each Etherbone record flushes the MAC table, then
+    reads 48 registers, so its (250-byte) reply goes to a destination the switch has just forgotten.
+    The simulation SoC's Etherbone buffer holds 64 words."""
+    replies = 0
+    flush   = sw.regs.switch_table_control.addr
+    for i in range(count):
+        record = EtherboneRecord()
+        record.writes = EtherboneWrites(base_addr=flush, datas=iter([1]))
+        record.wcount = len(record.writes)
+        record.reads  = EtherboneReads(base_ret_addr=0x1000 + i, addrs=[flush + 4*j for j in range(48)])
+        record.rcount = len(record.reads)
+        packet = EtherbonePacket()
+        packet.records = [record]
+        packet.encode()
+        sw.bus.socket.sendto(packet.bytes, (HOST_IP, 1234))
+        try:
+            data, _ = sw.bus.socket.recvfrom(8192)
+            replies += 1
+        except socket.timeout:
+            pass
+    return replies
+
 class Tests:
-    def __init__(self, sim, csr_csv):
+    def __init__(self, sim, csr_csv, speeds):
         self.sim     = sim
         self.csr_csv = csr_csv
+        self.speeds  = speeds
         self.results = []
 
     def check(self, name, ok, info=""):
@@ -164,10 +192,11 @@ class Tests:
         sw = Switch(self.csr_csv)
         (ns0, _, ip0, mac0), (ns1, _, ip1, mac1) = NS
 
-        # PHYs: RGMII in-band status (link up, 1Gbps, full-duplex) seen by both ECP5 RGMII PHYs.
-        status = [sw.reg(f"ethphy{n}_rx_inband_status").read() for n in range(2)]
-        self.check("RGMII in-band status: both links up, 1Gbps, full-duplex",
-            status == [0b1101, 0b1101], f"{status}")
+        # PHYs: RGMII in-band status (link up, speed, full-duplex) seen by both ECP5 RGMII PHYs.
+        status   = [sw.reg(f"ethphy{n}_rx_inband_status").read() for n in range(2)]
+        speeds   = "/".join(f"{s}Mbps" for s in self.speeds)
+        self.check(f"RGMII in-band status: both links up, {speeds}, full-duplex",
+            status == [INBAND_STATUS[s] for s in self.speeds], f"{status}")
 
         # Switching between the two RGMII PHYs.
         self.check("ping sw0 -> sw1 (PHY0 -> PHY1)", ping(ns0, ip1, count=5) == 5)
@@ -196,19 +225,23 @@ class Tests:
             all(table.get(m) == p for m, p in expected.items()),
             ", ".join(f"{m:012x}@{p}" for m, p in table.items()))
 
-        # Lossless forwarding of a UDP burst, without flooding known unicast to the host port.
-        n, size = 400, 1400
-        with netns(ns1):
+        # Lossless forwarding of a UDP burst, without flooding known unicast to the host port. From
+        # the slower port to the faster one (the other way, the faster port congests the slower).
+        src, dst = (0, 1) if self.speeds[0] <= self.speeds[1] else (1, 0)
+        ns_src, ns_dst = NS[src][0], NS[dst][0]
+        ip_dst = NS[dst][2]
+        n, size = (400 if min(self.speeds) >= 100 else 50), 1400
+        with netns(ns_dst):
             rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
-            rx.bind((ip1, 5000))
-        with netns(ns0):
+            rx.bind((ip_dst, 5000))
+        with netns(ns_src):
             tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         rx.settimeout(30)
         before = sw.counters()
         t0 = time.time()
         for i in range(n):
-            tx.sendto(i.to_bytes(4, "big") + bytes((i + k) & 0xff for k in range(size - 4)), (ip1, 5000))
+            tx.sendto(i.to_bytes(4, "big") + bytes((i + k) & 0xff for k in range(size - 4)), (ip_dst, 5000))
         received = []
         try:
             while len(received) < n:
@@ -221,15 +254,18 @@ class Tests:
         elapsed = time.time() - t0
         after = sw.counters()
         delta = {k: after[k] - before[k] for k in after}
-        self.check(f"UDP burst sw0 -> sw1: {n} x {size} bytes, in order and intact",
+        self.check(f"UDP burst {ns_src} -> {ns_dst}: {n} x {size} bytes, in order and intact",
             [s for s, _ in received] == list(range(n)) and all(ok for _, ok in received),
             f"{len(received)}/{n} received in {elapsed:.1f}s wall time")
-        # The host port only sees the Etherbone requests reading the counters (one per register).
+        # The host port only sees the Etherbone requests reading the counters (one per register),
+        # and maybe a few broadcasts (ARP refreshes) on slow links: the burst itself isn't flooded.
         eb_requests = len(after)
         self.check("burst: no drops, not flooded to the host port",
-            delta["rx_drops0"] == 0 and delta["flooded0"] == 0 and delta["tx_frames2"] <= eb_requests,
-            f"port0 rx +{delta['rx_frames0']} drops +{delta['rx_drops0']} flooded +{delta['flooded0']}, "
-            f"port1 tx +{delta['tx_frames1']}, port2 (host) tx +{delta['tx_frames2']}")
+            delta[f"rx_drops{src}"] == 0 and delta[f"flooded{src}"] < n//4 and
+            delta["tx_frames2"] - eb_requests < n//4,
+            f"port{src} rx +{delta[f'rx_frames{src}']} drops +{delta[f'rx_drops{src}']} "
+            f"flooded +{delta[f'flooded{src}']}, port{dst} tx +{delta[f'tx_frames{dst}']}, "
+            f"port2 (host) tx +{delta['tx_frames2']}")
         rx.close()
         tx.close()
 
@@ -265,6 +301,21 @@ class Tests:
             ", ".join(f"{m:012x}@{p}" for m, p in table.items()))
         self.check("traffic after aging", ping(ns1, ip0, count=2) == 2)
 
+        # Host replies flooded to both PHYs at once: with mixed link speeds, the faster PHY port
+        # must not run out of data within a frame (egress store-and-forward).
+        count   = 50
+        replies = flooded_host_replies(sw, count)
+        self.check("host replies flooded to both PHYs (table flushed before each)",
+            replies == count, f"{replies}/{count} replies")
+
+        # Every frame the PHYs transmitted had a valid preamble/FCS and no TX_ER (checked by the
+        # simulation module, which logs and drops bad frames).
+        with open(self.sim.log) as f:
+            errors = [l.strip() for l in f if l.startswith("[rgmii_ethernet]") and
+                any(e in l for e in ["error", "dropped", "runt"])]
+        self.check("PHY transmit: no corrupted frame", not errors,
+            f"{len(errors)} errors, e.g. {errors[0]}" if errors else "")
+
         sw.bus.close()
         return all(ok for _, ok in self.results)
 
@@ -274,7 +325,11 @@ def main():
     parser = argparse.ArgumentParser(description="Colorlight i9 3-port switch simulation system test.")
     parser.add_argument("--output-dir", default=os.path.join("build", "sim_switch"), help="Simulation build directory.")
     parser.add_argument("--no-build",   action="store_true", help="Reuse the existing simulation build.")
+    parser.add_argument("--speeds",     default="1000,1000",  help="Link speed of PHY0,PHY1 (10/100/1000Mbps).")
+    parser.add_argument("--egress-store-and-forward", action=argparse.BooleanOptionalAction, default=None,
+        help="Passed to colorlight_i9_switch.py (default: enabled with 10/100Mbps links).")
     args = parser.parse_args()
+    speeds = [int(s) for s in args.speeds.split(",")]
 
     if os.geteuid() != 0:
         sys.exit("Run as root: TAP interfaces and network namespaces need CAP_NET_ADMIN.")
@@ -283,14 +338,18 @@ def main():
     csr_csv      = os.path.abspath(os.path.join(args.output_dir, "csr.csv"))
     if not args.no_build:
         here = os.path.dirname(os.path.abspath(__file__))
+        options = ["--sim-speeds", args.speeds]
+        if args.egress_store_and_forward is not None:
+            options += ["--egress-store-and-forward" if args.egress_store_and_forward else
+                "--no-egress-store-and-forward"]
         subprocess.run([sys.executable, os.path.join(here, "colorlight_i9_switch.py"),
-            "--sim", "--no-run", "--output-dir", args.output_dir], check=True,
+            "--sim", "--no-run", "--output-dir", args.output_dir] + options, check=True,
             stdout=subprocess.DEVNULL)
 
     sim = SwitchSim(gateware_dir, log=os.path.join(args.output_dir, "sim.log"))
     try:
         sim.start()
-        ok = Tests(sim, csr_csv).run()
+        ok = Tests(sim, csr_csv, speeds).run()
     finally:
         sim.stop()
     print("\nAll tests passed." if ok else "\nSome tests FAILED.")

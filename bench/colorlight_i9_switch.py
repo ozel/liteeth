@@ -17,6 +17,13 @@ Hardware:
 
 Simulation (Verilator, same SoC with each RGMII PHY bridged to a TAP interface, run as root):
     ./colorlight_i9_switch.py --sim
+
+Options:
+    --with-dynamic-link          PHYs follow the link speed (10/100/1000Mbps) instead of 1Gbps only.
+    --egress-store-and-forward   PHY ports transmit whole frames only: required with mixed link
+                                 speeds, enabled by default with --with-dynamic-link.
+    --sim-speeds 100,1000        Simulated link speed of each PHY (implies --with-dynamic-link if
+                                 not 1000).
 """
 
 import os
@@ -45,8 +52,10 @@ class SwitchSoC(SoCMini):
         host_mac     = 0x10e2d5000000,
         host_ip      = "192.168.1.50",
         udp_port     = 1234,
+        etherbone_buffer_depth = 16,
         table_depth  = 256,
         aging_time   = 300,
+        egress_store_and_forward = False,
         **phy_kwargs):
         SoCMini.__init__(self, platform, clk_freq=sys_clk_freq, ident=ident, ident_version=True)
 
@@ -60,9 +69,12 @@ class SwitchSoC(SoCMini):
             phys.append(phy)
 
         # Switch -----------------------------------------------------------------------------------
+        # Store-and-forward egress on the PHY ports when enabled: with ports at different speeds,
+        # a flood reaches them at the pace of the slowest one.
         self.switch = switch = LiteEthSwitch(nports=3, dw=32, clk_freq=sys_clk_freq,
             table_depth = table_depth,
             aging_time  = aging_time,
+            egress_store_and_forward = [0, 1] if egress_store_and_forward else [],
         )
         for n, phy in enumerate(phys):
             # Preamble/FCS/padding in sys: only width conversion and CDC run at 125MHz. 16-word
@@ -81,7 +93,7 @@ class SwitchSoC(SoCMini):
             dw          = 32,
         )
         switch.connect(2, ethcore)
-        self.etherbone = LiteEthEtherbone(ethcore.udp, udp_port, buffer_depth=16)
+        self.etherbone = LiteEthEtherbone(ethcore.udp, udp_port, buffer_depth=etherbone_buffer_depth)
         self.bus.add_master(name="etherbone", master=self.etherbone.wishbone.bus)
         self.phys = phys
 
@@ -141,24 +153,28 @@ class SimSwitchSoC(SwitchSoC):
         for n in range(2):
             pads = platform.request("eth", n)
             rgmii_pads.append((RGMIISimClockPads(platform, n, pads), pads))
+        # Larger Etherbone records: the system test makes the host send long replies.
+        kwargs.setdefault("etherbone_buffer_depth", 64)
         SwitchSoC.__init__(self, platform, sys_clk_freq,
             rgmii_pads = rgmii_pads,
             ident      = "LiteEth 3-port switch simulation (Colorlight i9 PHYs)",
             **kwargs)
 
-def sim_main(args):
+def sim_main(args, soc_kwargs):
     from litex.build.sim.config import SimConfig
-    from liteeth.phy.simulation.rgmii import add_rgmii_sim_module, rgmii_sim_extra_mods
+    from liteeth.phy.simulation.rgmii import add_rgmii_sim_module, rgmii_sim_extra_mods, rgmii_clk_freqs
 
     sys_clk_freq = 50e6
     sim_config   = SimConfig()
     sim_config.add_clocker("sys_clk", freq_hz=sys_clk_freq)
-    for n, tap in enumerate(args.taps):
+    for n, (tap, speed) in enumerate(zip(args.taps, args.sim_speeds)):
         # PHY1's clock is shifted by half a period: the PHYs are not synchronous to each other.
-        add_rgmii_sim_module(sim_config, n, tap, phase_deg=180*n)
-    assert sim_config.get_timebase_ps() < 4000, "Timebase must be below half an RGMII clock period."
+        add_rgmii_sim_module(sim_config, n, tap, phase_deg=180*n, speed=speed)
+    min_half_period_ps = min(1e12/(2*rgmii_clk_freqs[speed]) for speed in args.sim_speeds)
+    assert sim_config.get_timebase_ps() < min_half_period_ps, \
+        "Timebase must be below half an RGMII clock period."
 
-    soc = SimSwitchSoC(sys_clk_freq=sys_clk_freq, host_ip=args.host_ip, aging_time=args.aging_time)
+    soc = SimSwitchSoC(sys_clk_freq=sys_clk_freq, **soc_kwargs)
     builder = Builder(soc, output_dir=args.output_dir, csr_csv=os.path.join(args.output_dir, "csr.csv"))
     builder.build(
         sim_config  = sim_config,
@@ -191,17 +207,35 @@ def main():
     parser.add_argument("--host-ip",    default="192.168.1.50",    help="Internal host IP address.")
     parser.add_argument("--aging-time", default=300, type=float,   help="MAC table aging time (s).")
     parser.add_argument("--output-dir", default=None,              help="Build directory.")
+    parser.add_argument("--with-dynamic-link", action="store_true", help="10/100/1000Mbps PHYs (default: 1Gbps only).")
+    parser.add_argument("--egress-store-and-forward", action=argparse.BooleanOptionalAction, default=None,
+        help="Transmit whole frames only on PHY ports (default: with --with-dynamic-link).")
+    parser.add_argument("--sim-speeds", default="1000,1000", help="Simulated link speed of PHY0,PHY1 (10/100/1000).")
     args = parser.parse_args()
-    args.taps = args.taps.split(",")
-    assert len(args.taps) == 2
+    args.taps       = args.taps.split(",")
+    args.sim_speeds = [int(s) for s in args.sim_speeds.split(",")]
+    assert len(args.taps) == 2 and len(args.sim_speeds) == 2
+    assert all(s in [10, 100, 1000] for s in args.sim_speeds)
+
+    if args.sim and any(s != 1000 for s in args.sim_speeds) and not args.with_dynamic_link:
+        print("Simulated 10/100Mbps links: enabling --with-dynamic-link.")
+        args.with_dynamic_link = True
+    if args.egress_store_and_forward is None:
+        args.egress_store_and_forward = args.with_dynamic_link
+    soc_kwargs = dict(
+        host_ip                  = args.host_ip,
+        aging_time               = args.aging_time,
+        with_dynamic_link        = args.with_dynamic_link,
+        egress_store_and_forward = args.egress_store_and_forward,
+    )
 
     if args.sim:
         args.output_dir = args.output_dir or os.path.join("build", "sim_switch")
-        sim_main(args)
+        sim_main(args, soc_kwargs)
         return
 
     args.output_dir = args.output_dir or os.path.join("build", "colorlight_i9_switch")
-    soc = ColorlightI9SwitchSoC(revision=args.revision, host_ip=args.host_ip, aging_time=args.aging_time)
+    soc = ColorlightI9SwitchSoC(revision=args.revision, **soc_kwargs)
     builder = Builder(soc, output_dir=args.output_dir, csr_csv=os.path.join(args.output_dir, "csr.csv"))
     builder.build(run=args.build)
 

@@ -11,6 +11,7 @@ from litex.gen import *
 
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import *
+from litex.soc.interconnect.packet import PacketFIFO
 
 from liteeth.common import *
 from liteeth.fifo import PacketDropFIFO
@@ -287,9 +288,25 @@ class LiteEthSwitchAllocator(LiteXModule):
 # Switch Egress ------------------------------------------------------------------------------------
 
 class LiteEthSwitchEgress(LiteXModule):
-    """Egress FIFO of a port. Its input ready doesn't depend on valid, as lockstep fan-out needs."""
-    def __init__(self, dw, depth=8):
-        self.fifo   = fifo = stream.SyncFIFO(eth_phy_description(dw), depth=depth, buffered=True)
+    """Egress FIFO of a port. Its input ready doesn't depend on valid, as lockstep fan-out needs.
+
+    By default a small FIFO: frames are passed on as they arrive (cut-through). A flood is sent to
+    all its egress ports in lockstep, at the pace of the slowest one, so with egress ports running
+    at different speeds (e.g. 100Mbps and 1Gbps PHYs) a faster PHY port would run out of data in the
+    middle of a frame. With ``store_and_forward``, the egress holds each frame until complete,
+    which ``payload_depth`` words must allow for the largest frame, and also frees the ingress as
+    fast as the fabric goes when the port itself is slow.
+    """
+    def __init__(self, dw, depth=8, store_and_forward=False, payload_depth=None, param_depth=16):
+        if store_and_forward:
+            assert payload_depth is not None
+            self.fifo = fifo = PacketFIFO(eth_phy_description(dw),
+                payload_depth = payload_depth,
+                param_depth   = param_depth,
+                buffered      = True,
+            )
+        else:
+            self.fifo = fifo = stream.SyncFIFO(eth_phy_description(dw), depth=depth, buffered=True)
         self.sink   = fifo.sink
         self.source = fifo.source
 
@@ -326,7 +343,10 @@ class LiteEthSwitch(LiteXModule):
     - aging_time   : MAC table aging time in seconds.
     - buffer_size  : Ingress buffer per port in bytes (power of two, at least one maximum frame).
     - param_depth  : Frames each ingress buffer can hold.
-    - egress_depth : Egress FIFO depth in words.
+    - egress_depth : Egress FIFO depth in words (cut-through egress ports).
+    - egress_store_and_forward : Egress ports holding whole frames before transmitting them: True
+      (all), False (none) or a list of ports. Required on PHY ports when ports run at different
+      speeds; costs a buffer of ``buffer_size`` bytes per port.
     - with_csr     : Expose control/statistics CSRs.
     """
     def __init__(self, nports=3, dw=32, clk_freq=None,
@@ -335,6 +355,7 @@ class LiteEthSwitch(LiteXModule):
         buffer_size  = 4096,
         param_depth  = 16,
         egress_depth = 8,
+        egress_store_and_forward = False,
         with_csr     = True,
         ):
         assert nports >= 2
@@ -342,9 +363,14 @@ class LiteEthSwitch(LiteXModule):
         buffer_depth = buffer_size//(dw//8)
         assert buffer_depth == 2**log2_int(buffer_depth)
         assert buffer_size >= eth_mtu_default
+        if egress_store_and_forward is True:
+            egress_store_and_forward = range(nports)
+        elif egress_store_and_forward is False:
+            egress_store_and_forward = []
         self.nports = nports
         self.dw     = dw
         self.ports  = ports = [LiteEthSwitchPort(dw) for _ in range(nports)]
+        self.egress_store_and_forward = sorted(egress_store_and_forward)
 
         # # #
 
@@ -367,7 +393,12 @@ class LiteEthSwitch(LiteXModule):
                 buffer_depth = buffer_depth,
                 param_depth  = param_depth,
             )
-            egress = LiteEthSwitchEgress(dw, depth=egress_depth)
+            egress = LiteEthSwitchEgress(dw,
+                depth             = egress_depth,
+                store_and_forward = n in self.egress_store_and_forward,
+                payload_depth     = buffer_depth,
+                param_depth       = param_depth,
+            )
             self.add_module(name=f"ingress{n}", module=ingress)
             self.add_module(name=f"egress{n}",  module=egress)
             self.comb += [

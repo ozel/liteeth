@@ -33,6 +33,9 @@ host (ICMP + Etherbone) on the third port: [`bench/colorlight_i9_switch.py`](../
   clears an entry's age bit, or invalidates the entry when the bit was already clear; learning
   sets it. Idle addresses therefore expire within `aging_time` (default 300s).
 - **Port isolation**: each port has a `forward_mask` of the ports it may forward to.
+- **Egress store and forward** (optional, `egress_store_and_forward`): selected egress ports hold
+  each frame until complete before passing it to their MAC. Required on PHY ports when ports run
+  at different speeds, see [Mixed link speeds](#mixed-link-speeds).
 
 ### Datapath and allocation
 
@@ -44,6 +47,24 @@ flood is transmitted once, in lockstep, to every egress port. Grants never hold-
 concurrent floods can't deadlock. Requests are served in round-robin order; the first waiting
 requester reserves the egress ports it waits for, so floods can't be starved by unicast traffic,
 while requests to other egress ports proceed in parallel.
+
+### Mixed link speeds
+
+A flood progresses in lockstep, at the pace of its slowest egress port. By default egress ports are
+cut-through (an 8-word FIFO): a PHY port starts transmitting a frame as it arrives, and its MAC/PHY
+transmit path can't pause within a frame. With ports at different speeds, e.g. 100Mbps and 1Gbps,
+a flood towards both would feed the 1Gbps port at 100Mbps: it runs out of data mid-frame and
+sends a broken frame. Unicast traffic is not affected.
+
+With `egress_store_and_forward`, an egress port holds each frame in a `PacketFIFO` of `buffer_size`
+bytes (any frame the ingress accepts) and only releases it complete, so its PHY always transmits at
+line rate. A slow egress port then also takes frames at fabric speed while it has room, freeing
+the ingress for other traffic sooner. It costs a `buffer_size` buffer per port (3 block RAMs for
+4KiB with `dw=32`) and adds one frame time of latency on those ports.
+
+`TestSwitchMixedSpeed` in `test/test_switch.py` floods frames towards a 1Gbps and a 100Mbps egress
+port: with cut-through egresses the 1Gbps port starves for thousands of cycles per 1518-byte frame,
+with store-and-forward egresses never.
 
 ### MAC table
 
@@ -147,7 +168,8 @@ preamble/FCS (`eth_phy_description(dw)`), e.g. `LiteEthMACWishboneInterface` for
 | `aging_time`   | 300     | Aging time in seconds (0: aging disabled by default).           |
 | `buffer_size`  | 4096    | Ingress buffer per port in bytes (power of two, >= one frame).  |
 | `param_depth`  | 16      | Frames each ingress buffer can hold.                            |
-| `egress_depth` | 8       | Egress FIFO depth in words.                                     |
+| `egress_depth` | 8       | Egress FIFO depth in words (cut-through egress ports).          |
+| `egress_store_and_forward` | False | Store-and-forward egress ports: True (all), False or a list of ports. |
 | `with_csr`     | True    | Control/statistics CSRs.                                        |
 
 ### CSRs
@@ -180,6 +202,14 @@ ping 192.168.1.50                                    # Internal host, from eithe
 litex_server --udp --udp-ip 192.168.1.50 &           # Then e.g. litex_cli --regs | grep switch
 ```
 
+Options:
+
+| Option                          | Effect                                                         |
+|---------------------------------|----------------------------------------------------------------|
+| (default)                       | 1Gbps PHYs, cut-through egress ports.                           |
+| `--with-dynamic-link`           | PHYs follow the link speed (10/100/1000Mbps, from the RGMII in-band status), each one independently. Enables `--egress-store-and-forward`. |
+| `--egress-store-and-forward`    | Store-and-forward egress on the PHY ports (also usable at 1Gbps). `--no-egress-store-and-forward` disables it with `--with-dynamic-link`. |
+
 ### Resources and timing
 
 Built with yosys 0.69 / nextpnr-ecp5 0.11 for the LFE5U-45F-6, compared with single-port
@@ -210,9 +240,13 @@ meets timing thanks to the MAC cores' `sys` datapath and 16-word buffered clock 
 `./bench/colorlight_i9_switch.py --sim` simulates the same SoC with Verilator. The ECP5 RGMII PHYs
 are kept: their I/O primitives (DDR I/Os, `DELAYG`) are modeled and the `rgmii_ethernet` LiteX
 simulation module ([`liteeth/phy/simulation`](../liteeth/phy/simulation)) plays each external PHY,
-bridging its RGMII pads to a TAP interface (`tap0`, `tap1`): it generates the DDR RX stream with
-preamble/FCS and in-band status (link up, 1Gbps, full-duplex), and checks the preamble/FCS of
-transmitted frames. Set `RGMII_ETHERNET_DEBUG=1` to log frames.
+bridging its RGMII pads to a TAP interface (`tap0`, `tap1`): it generates the RX stream with
+preamble/FCS and in-band status (link up, speed, full-duplex), and checks the preamble/FCS of
+transmitted frames, logging and dropping bad ones. Set `RGMII_ETHERNET_DEBUG=1` to log frames.
+
+Each link runs at 1Gbps by default (125MHz, DDR), or at 100/10Mbps (25/2.5MHz, a nibble per clock)
+with `--sim-speeds`, e.g. `--sim-speeds 100,1000`, which implies `--with-dynamic-link` (and so
+store-and-forward egresses). The simulated SoC's Etherbone takes 64-word records (16 on hardware).
 
 [`bench/test_colorlight_i9_switch_sim.py`](../bench/test_colorlight_i9_switch_sim.py) builds and
 runs the simulation, moves each TAP into its own network namespace, so that the host kernel can't
@@ -230,9 +264,27 @@ sw1: tap1 192.168.1.101 -- PHY1 --+
   are raised to 9000 bytes; the simulation module reads up to 9018-byte frames).
 - Ping of the internal host from both namespaces, alternately.
 - MAC table contents (read over Etherbone through the switch).
-- A 400 x 1400-byte UDP burst between the namespaces: in order, intact, no drops and not flooded
-  to the host port.
+- A 400 x 1400-byte UDP burst (50 at 10Mbps) from the slower to the faster port: in order,
+  intact, no drops and not flooded to the host port.
 - Port isolation, table flush and relearning, aging.
+- 50 host replies flooded to both PHYs: Etherbone records flushing the MAC table, then reading 48
+  registers, so that each 250-byte reply goes to a destination the switch has just forgotten.
+- No corrupted frame transmitted by either PHY (preamble, FCS, TX_ER), from the simulation log.
+
+`--speeds` sets the link speeds and `--egress-store-and-forward`/`--no-egress-store-and-forward`
+overrides the default:
+
+| PHY0 / PHY1   | Egress ports      | Result                                                      |
+|---------------|-------------------|-------------------------------------------------------------|
+| 1000 / 1000   | cut-through       | All checks pass.                                            |
+| 100 / 1000    | cut-through       | 1850 frame errors (FCS) on the 1Gbps PHY from the flooded host replies, the rest passes. |
+| 100 / 1000    | store-and-forward | All checks pass.                                            |
+| 10 / 1000     | store-and-forward | All checks pass.                                            |
+| 100 / 100     | store-and-forward | All checks pass.                                            |
+
+```sh
+./bench/test_colorlight_i9_switch_sim.py --speeds 100,1000
+```
 
 Unit tests of the switch logic: `python3 -m unittest test.test_switch`.
 
@@ -245,5 +297,8 @@ Unit tests of the switch logic: `python3 -m unittest test.test_switch`.
   [Maximum frame length](#maximum-frame-length)).
 - Head-of-line blocking: an ingress waits for all the egress ports of its head frame. An internal
   port that stops accepting frames eventually stalls the floods towards it.
-- PHY ports run at 1Gbps (the ECP5 RGMII PHY's `with_dynamic_link` would add 10/100Mbps; this
-  is not exercised by the simulation).
+- Ports at different speeds need store-and-forward egress PHY ports (see
+  [Mixed link speeds](#mixed-link-speeds)). Traffic from a faster to a slower port is only absorbed
+  by the buffers, then dropped (no flow control).
+- 10/100Mbps operation is verified in simulation only, with the simulation module standing in for
+  the B50612D PHYs (half-duplex is not supported).

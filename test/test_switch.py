@@ -210,9 +210,15 @@ class TestSwitch(unittest.TestCase):
         self.assertEqual(bench.received[2], [seq[0][1], seq[1][1], seq[4][1]])
 
     def test_concurrent_floods_no_deadlock(self):
+        self.check_concurrent_floods()
+
+    def test_concurrent_floods_no_deadlock_store_and_forward(self):
+        self.check_concurrent_floods(egress_store_and_forward=True)
+
+    def check_concurrent_floods(self, **kwargs):
         # Every port floods simultaneously while egresses stall randomly: each port must receive
         # every frame from the other ports, in order per source.
-        dut   = new_switch()
+        dut   = new_switch(**kwargs)
         bench = SwitchBench(dut, seed=3, rx_gap=4, tx_stall=3)
         sent  = [[], [], []]
         prng  = random.Random(5)
@@ -375,11 +381,12 @@ class TestSwitchLineRate(unittest.TestCase):
     Each ingress receives frames at exactly line rate (preamble, FCS and IFG included) and each
     egress is drained at line rate: no frame may be dropped, lost, reordered or corrupted.
     """
-    sys_clk_freq = 50e6
-    word_cycles  = 4*8e-9*sys_clk_freq # Cycles per 32-bit word at 1Gbps: 1.6.
+    sys_clk_freq   = 50e6
+    word_cycles    = 4*8e-9*sys_clk_freq # Cycles per 32-bit word at 1Gbps: 1.6.
+    switch_kwargs  = {}
 
     def run_load(self, pattern, length, nframes):
-        dut      = new_switch(clk_freq=self.sys_clk_freq, buffer_size=4096)
+        dut      = new_switch(clk_freq=self.sys_clk_freq, buffer_size=4096, **self.switch_kwargs)
         overhead = 8 + 4 + 12 # Preamble, FCS and IFG bytes.
         wire     = (length + overhead)*8e-9*self.sys_clk_freq # Cycles per frame on the wire.
         start    = 400 # Once every station has been learned.
@@ -468,6 +475,73 @@ class TestSwitchLineRate(unittest.TestCase):
 
     def test_flood_min_frames(self):
         self.check({0: None}, length=60, nframes=100)
+
+class TestSwitchLineRateStoreAndForward(TestSwitchLineRate):
+    """Same load with store-and-forward egresses: whole frames are held, throughput is unchanged."""
+    switch_kwargs = {"egress_store_and_forward": True}
+
+# Mixed Speed Tests --------------------------------------------------------------------------------
+
+class TestSwitchMixedSpeed(unittest.TestCase):
+    """Floods towards a 1Gbps and a 100Mbps egress port (dw=32, 50MHz).
+
+    A flood reaches all its egress ports in lockstep, at the pace of the slowest. A PHY port must
+    never run out of data within a frame (its MAC/PHY transmit path can't pause): with cut-through
+    egresses the 1Gbps port starves, with store-and-forward egresses it only ever transmits complete
+    frames.
+    """
+    word_cycles = {1: 1.6, 2: 16.0} # 1Gbps, 100Mbps.
+
+    def run_floods(self, nframes, length=1518, gap=0, **kwargs):
+        dut      = new_switch(buffer_size=4096, **kwargs)
+        starved  = {1: 0, 2: 0}
+        got      = {1: [], 2: []}
+        sent     = [frame(BCAST, mac(0), length, seed=i) for i in range(nframes)]
+
+        def egress(p):
+            # A wire wanting a word every word_cycles[p]; counts starvation within frames.
+            ep, c, free, in_frame, current = dut.ports[p].source, 0, 0.0, False, []
+            while True:
+                want = c >= free
+                yield ep.ready.eq(int(want))
+                yield
+                if want and (yield ep.valid):
+                    free = (free if c < free + 1 else c) + self.word_cycles[p]
+                    data, be = (yield ep.data), (yield ep.be)
+                    current += [(data >> 8*j) & 0xff for j in range(4) if (be >> j) & 1]
+                    in_frame = not (yield ep.last)
+                    if not in_frame:
+                        got[p].append(current)
+                        current = []
+                elif want and in_frame:
+                    starved[p] += 1
+                c += 1
+
+        def main():
+            for f in sent:
+                yield from inject(dut.ports[0].sink, f, idle=gap)
+            for _ in range(int(nframes*(length//4 + 8)*self.word_cycles[2]) + 1000):
+                yield
+
+        run_simulation(dut, [main()] + [passive(egress)(p) for p in [1, 2]])
+        for p in [1, 2]:
+            self.assertEqual(got[p], sent)
+        return starved[1]
+
+    def test_cut_through_starves_fast_port(self):
+        # Documents why store-and-forward egresses are needed with mixed speeds.
+        self.assertGreater(self.run_floods(nframes=1), 1000)
+
+    def test_store_and_forward_never_starves(self):
+        for ports in [True, [1, 2]]:
+            with self.subTest(egress_store_and_forward=ports):
+                self.assertEqual(self.run_floods(nframes=4, egress_store_and_forward=ports), 0)
+
+    def test_store_and_forward_max_frame(self):
+        # The egress buffer holds the largest frame the ingress accepts. The ingress buffer holds a
+        # single one: leave time for the first frame to move on before sending the second.
+        self.assertEqual(self.run_floods(nframes=2, length=4096, gap=1100,
+            egress_store_and_forward=True), 0)
 
 # Allocator Tests ----------------------------------------------------------------------------------
 

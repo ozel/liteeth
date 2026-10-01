@@ -6,9 +6,10 @@
 
 """RGMII simulation support: run a real RGMII PHY (e.g. the ECP5 one) against a host TAP interface.
 
-The ``rgmii_ethernet`` LiteX simulation module plays the external PHY on the RGMII pads. Clock each
-PHY with its own ``clocker`` (125MHz) and keep the simulation timebase below 4ns (half an RGMII
-clock period), so pad updates never coincide with the RGMII clock edges they are sampled on.
+The ``rgmii_ethernet`` LiteX simulation module plays the external PHY on the RGMII pads, at 10, 100
+or 1000Mbps. Clock each PHY with its own ``clocker`` and keep the simulation timebase below half an
+RGMII clock period (4ns at 1Gbps), so pad updates never coincide with the clock edges they are
+sampled on.
 """
 
 import os
@@ -47,10 +48,16 @@ class RGMIISimClockPads:
 
 # Simulation config --------------------------------------------------------------------------------
 
-def add_rgmii_sim_module(sim_config, n, interface, ip=None, mac=None, phase_deg=0):
-    """Clock RGMII PHY ``n`` and bridge it to TAP ``interface``."""
-    sim_config.add_clocker(f"eth{n}_rx_clk", freq_hz=125e6, phase_deg=phase_deg)
-    args = {"interface": interface}
+rgmii_clk_freqs = {1000: 125e6, 100: 25e6, 10: 2.5e6}
+
+def add_rgmii_sim_module(sim_config, n, interface, ip=None, mac=None, phase_deg=0, speed=1000):
+    """Clock RGMII PHY ``n`` and bridge it to TAP ``interface``.
+
+    ``speed`` (10, 100 or 1000Mbps) sets the RGMII clock and the link speed reported to the PHY
+    in-band: 10/100Mbps need a PHY decoding it (e.g. the ECP5 RGMII PHY's ``with_dynamic_link``).
+    """
+    sim_config.add_clocker(f"eth{n}_rx_clk", freq_hz=rgmii_clk_freqs[speed], phase_deg=phase_deg)
+    args = {"interface": interface, "speed": str(speed)}
     if ip is not None:
         args["ip"] = ip
     if mac is not None:
