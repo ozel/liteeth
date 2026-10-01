@@ -367,6 +367,108 @@ class TestSwitch(unittest.TestCase):
     def test_line_rate_flood(self):
         self.check_line_rate(BCAST, egress=[1, 2])
 
+# Line-rate Load Tests -----------------------------------------------------------------------------
+
+class TestSwitchLineRate(unittest.TestCase):
+    """Sustained 1Gbps on every ingress and egress at once, as on the Colorlight i9 (dw=32, 50MHz).
+
+    Each ingress receives frames at exactly line rate (preamble, FCS and IFG included) and each
+    egress is drained at line rate: no frame may be dropped, lost, reordered or corrupted.
+    """
+    sys_clk_freq = 50e6
+    word_cycles  = 4*8e-9*sys_clk_freq # Cycles per 32-bit word at 1Gbps: 1.6.
+
+    def run_load(self, pattern, length, nframes):
+        dut      = new_switch(clk_freq=self.sys_clk_freq, buffer_size=4096)
+        overhead = 8 + 4 + 12 # Preamble, FCS and IFG bytes.
+        wire     = (length + overhead)*8e-9*self.sys_clk_freq # Cycles per frame on the wire.
+        start    = 400 # Once every station has been learned.
+        cycle    = [0]
+        drops    = [0]
+        sent     = {p: [] for p in pattern}
+        got      = [[] for _ in range(3)]
+        learn    = {p: frame(BCAST, mac(p), 60, seed=255) for p in range(3)} # Unlike sent payloads.
+
+        def clock():
+            while True:
+                yield
+                cycle[0] += 1
+
+        def ingress(p, dst):
+            src = mac(p)
+            yield from inject(dut.ports[p].sink, learn[p])
+            for i in range(nframes):
+                f = frame(dst, src, length, seed=i)
+                sent[p].append(f)
+                for k in range(0, len(f), 4):
+                    while cycle[0] < start + int(i*wire + (k//4)*self.word_cycles):
+                        yield
+                    word = f[k:k + 4]
+                    yield dut.ports[p].sink.valid.eq(1)
+                    yield dut.ports[p].sink.last.eq(k + 4 >= len(f))
+                    yield dut.ports[p].sink.data.eq(sum(b << 8*j for j, b in enumerate(word)))
+                    yield dut.ports[p].sink.be.eq((1 << len(word)) - 1)
+                    yield
+                    yield dut.ports[p].sink.valid.eq(0)
+
+        def egress(p):
+            # Wire model: a word every word_cycles, plus preamble/FCS/IFG time after each frame.
+            ep, current, c, free = dut.ports[p].source, [], 0, 0.0
+            while True:
+                yield ep.ready.eq(int(c >= free))
+                yield
+                if (yield ep.valid) and (yield ep.ready):
+                    # Keep the fractional schedule while busy; restart it after an idle wire.
+                    free = (free if c < free + 1 else c) + self.word_cycles
+                    data, be = (yield ep.data), (yield ep.be)
+                    current += [(data >> 8*j) & 0xff for j in range(4) if (be >> j) & 1]
+                    if (yield ep.last):
+                        free += overhead/4*self.word_cycles
+                        if current not in learn.values():
+                            got[p].append(current)
+                        current = []
+                c += 1
+
+        def drop_monitor():
+            while True:
+                yield
+                for n in range(3):
+                    drops[0] += (yield getattr(dut, f"ingress{n}").ev_rx_drop)
+
+        def main():
+            for _ in range(start + int(nframes*wire) + 2000):
+                yield
+
+        run_simulation(dut, [main(), passive(clock)(), passive(drop_monitor)()] +
+            [ingress(p, dst) for p, dst in pattern.items()] +
+            [passive(egress)(p) for p in range(3)])
+        return sent, got, drops[0]
+
+    def check(self, pattern, length, nframes):
+        sent, got, drops = self.run_load({p: (BCAST if d is None else mac(d)) for p, d in pattern.items()},
+            length, nframes)
+        self.assertEqual(drops, 0)
+        for o in range(3):
+            # Frames from each source, in order; a flood (None) reaches every other port.
+            expected = [f for p in sorted(pattern) for f in sent[p] if pattern[p] in (o, None) and p != o]
+            for p in pattern:
+                from_p = [f for f in got[o] if f[6:12] == list(mac(p).to_bytes(6, "big"))]
+                self.assertEqual(from_p, [f for f in expected if f[6:12] == list(mac(p).to_bytes(6, "big"))],
+                    f"egress {o}, from port {p}")
+            self.assertEqual(len(got[o]), len(expected))
+
+    def test_three_ports_permutation_min_frames(self):
+        self.check({0: 1, 1: 2, 2: 0}, length=60, nframes=100)
+
+    def test_bridge_full_duplex_min_frames(self):
+        self.check({0: 1, 1: 0}, length=60, nframes=100)
+
+    def test_bridge_full_duplex_max_frames(self):
+        self.check({0: 1, 1: 0}, length=1514, nframes=8)
+
+    def test_flood_min_frames(self):
+        self.check({0: None}, length=60, nframes=100)
+
 # Allocator Tests ----------------------------------------------------------------------------------
 
 class TestSwitchAllocator(unittest.TestCase):

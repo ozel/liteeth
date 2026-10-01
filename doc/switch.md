@@ -39,8 +39,18 @@ host (ICMP + Etherbone) on the third port: [`bench/colorlight_i9_switch.py`](../
 The datapath is `dw` bits wide in the `sys` clock domain: the bandwidth per port and direction is
 `dw*sys_clk_freq`, minus a per-frame overhead (table lookup, allocation) of 5 cycles. With `dw=32`,
 a minimum-size frame takes 20 cycles, unicast or flooded: 400ns at 50MHz, against 672ns on a
-1Gbps wire (64 bytes + preamble + IFG), so the switch forwards faster than line rate even for
-minimum-size frames (see `test_line_rate_*` in `test/test_switch.py`).
+1Gbps wire (64 bytes + preamble + IFG). The overhead overlaps with egress transmission, so every
+port sustains 1Gbps in both directions at once: `TestSwitchLineRate` in `test/test_switch.py`
+feeds each ingress at exactly line rate and drains each egress like a 1Gbps wire (dw=32, 50MHz),
+and checks that nothing is dropped, lost, reordered or corrupted, for 3-port permutation traffic,
+a full-duplex 2-port bridge (64 and 1518-byte frames) and floods. Each ingress then only ever
+holds the frame being stored and forwarded.
+
+With 1Gbps ports this gives the switch a capacity of 2 x 1Gbps per port (full duplex) and a
+forwarding rate of 1.488Mpps per port (64-byte frames), e.g. 6Gbps / 4.46Mpps with 3 ports.
+Congestion (several ingresses towards one egress) is absorbed by the ingress buffers only, then
+frames are dropped. Since each ingress serves its frames in order, a frame waiting for a congested
+egress also delays the ones behind it (head-of-line blocking).
 
 An ingress requests all its egress ports at once and an allocator grants them atomically, so a
 flood is transmitted once, in lockstep, to every egress port. Grants never hold-and-wait, so
@@ -115,7 +125,11 @@ preamble/FCS (`eth_phy_description(dw)`), e.g. `LiteEthMACWishboneInterface` for
 The i9's PHYs share their reset and MDIO pins: PHY0 owns them, PHY1 only gets its data pins. Both
 use LiteEth's ECP5 RGMII PHY at 1Gbps, as litex-boards' `colorlight_i5` target does. The MAC cores
 process preamble/FCS/padding in `sys` (`with_sys_datapath=True`, 50MHz) so that only width
-conversion and clock domain crossing run at the 125MHz RGMII clocks.
+conversion and (16-word) clock domain crossings run at the 125MHz RGMII clocks.
+
+With yosys 0.69 / nextpnr-ecp5 0.11 (LFE5U-45F-6), the SoC uses 31% of the LUTs, 12% of the FFs and
+11 of 108 block RAMs, and meets timing: 151-159MHz on the RGMII clocks (125MHz required) and
+53-55MHz on `sys` (50MHz required), on two placement seeds.
 
 ```sh
 ./bench/colorlight_i9_switch.py --build --load
