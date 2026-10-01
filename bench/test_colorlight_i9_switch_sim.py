@@ -106,6 +106,7 @@ class SwitchSim:
             sh(f"ip netns exec {ns} ip link set lo up")
             sh(f"ip netns exec {ns} ip link set {tap} address {mac_str(mac)}")
             sh(f"ip netns exec {ns} ip addr add {ip}/24 dev {tap}")
+            sh(f"ip netns exec {ns} ip link set {tap} mtu 9000") # Allow frames past the switch limit.
             sh(f"ip netns exec {ns} ip link set {tap} up")
 
     def stop(self):
@@ -172,6 +173,17 @@ class Tests:
         self.check("ping sw0 -> sw1 (PHY0 -> PHY1)", ping(ns0, ip1, count=5) == 5)
         self.check("ping sw1 -> sw0 (PHY1 -> PHY0)", ping(ns1, ip0, count=5) == 5)
         self.check("ping sw0 -> sw1, 1514-byte frames", ping(ns0, ip1, count=3, size=1472) == 3)
+
+        # Frame lengths (without FCS): up to the 4KiB ingress buffer, then dropped and counted.
+        # 2048 - 2107 and full-word lengths: regressions of the MAC RX runt check.
+        forwarded = [64, 100, 1518, 2048, 2060, 2107, 4092, 4096]
+        ok = [L for L in forwarded if ping(ns0, ip1, count=1, size=L - 42) == 1]
+        drops = sw.reg("switch_ingress0_rx_drops").read()
+        too_long = ping(ns0, ip1, count=1, size=4097 - 42, timeout=2)
+        dropped = sw.reg("switch_ingress0_rx_drops").read() - drops
+        self.check("frame lengths: 64-4096 bytes forwarded, 4097 dropped and counted",
+            ok == forwarded and too_long == 0 and dropped == 1,
+            f"forwarded {ok}, 4097-byte frame drops +{dropped}")
 
         # Internal host, alternating between peers on both PHYs.
         ok = all(ping(ns, HOST_IP, count=2) == 2 for ns in [ns0, ns1, ns0, ns1])

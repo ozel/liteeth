@@ -82,18 +82,26 @@ class LiteEthMACPaddingChecker(Module):
         # drop the packet when
         # payload size < minimum ethernet payload size
 
-        length     = Signal(max=eth_mtu)
-        length_inc = Signal(4)
+        # Only lengths below packet_min_length matter: the count saturates there, so that it can't
+        # wrap whatever the frame length (eth_mtu is no longer needed and only kept for
+        # compatibility). The sum gets its own signal, wide enough for a saturated count plus a
+        # full word: in Verilog, an inline sum would be truncated to the width of the comparison.
+        length      = Signal(max=packet_min_length + dw//8)
+        length_inc  = Signal(bits_for(dw//8))
+        length_next = Signal(max=packet_min_length + 2*(dw//8))
 
         # Count valid bytes.
-        self.comb += length_inc.eq(stream.byte_count(sink.be))
+        self.comb += [
+            length_inc.eq(stream.byte_count(sink.be)),
+            length_next.eq(length + length_inc),
+        ]
 
         self.sync += [
             If(sink.valid & sink.ready,
                 If(sink.last,
                     length.eq(0),
-                ).Else(
-                    length.eq(length + length_inc)
+                ).Elif(length < packet_min_length,
+                    length.eq(length_next)
                 )
             )
         ]
@@ -101,7 +109,7 @@ class LiteEthMACPaddingChecker(Module):
         self.comb += [
             sink.connect(source, omit={"error"}),
 
-            If(sink.valid & sink.last & ((length + length_inc) < packet_min_length),
+            If(sink.valid & sink.last & (length_next < packet_min_length),
                 source.error.eq(Replicate(1, dw//8)),
             ).Else(
                 source.error.eq(sink.error),

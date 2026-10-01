@@ -10,7 +10,7 @@ import random
 from migen import *
 
 from liteeth.common import *
-from liteeth.mac.padding import LiteEthMACPaddingInserter
+from liteeth.mac.padding import LiteEthMACPaddingInserter, LiteEthMACPaddingChecker
 
 from test.test_stream import StreamPacket, stream_inserter, stream_collector
 
@@ -59,3 +59,42 @@ class TestMACPaddingInserter(unittest.TestCase):
                 for _ in range(40)]
             with self.subTest(dw=dw):
                 self.run_inserter(dw, lengths, seed=dw)
+
+# Test MAC Padding Checker -------------------------------------------------------------------------
+
+class TestMACPaddingChecker(unittest.TestCase):
+    packet_min_length = eth_min_frame_length - eth_fcs_length # 60 bytes.
+
+    def run_checker(self, dw, lengths):
+        """Return, for each frame, whether the checker flagged it as a runt."""
+        dut     = LiteEthMACPaddingChecker(dw, self.packet_min_length)
+        nb      = dw//8
+        flagged = []
+
+        def generator():
+            yield dut.source.ready.eq(1)
+            for length in lengths:
+                nwords = (length + nb - 1)//nb
+                for i in range(nwords):
+                    last = (i == nwords - 1)
+                    yield dut.sink.valid.eq(1)
+                    yield dut.sink.last.eq(last)
+                    yield dut.sink.be.eq((1 << (length - i*nb if last else nb)) - 1)
+                    yield
+                    if last:
+                        flagged.append((yield dut.source.error) != 0)
+                yield dut.sink.valid.eq(0)
+                yield
+
+        run_simulation(dut, generator())
+        return flagged
+
+    def test_lengths(self):
+        # Only frames shorter than the minimum are flagged, whatever their length otherwise
+        # (regression: the length counter wrapped at 2048 bytes).
+        lengths = [1, 59, 60, 61, 1530, 2047, 2048, 2049, 2107, 2108, 4096, 4100, 9000, 59]
+        for dw in [8, 32, 64, 128]:
+            with self.subTest(dw=dw):
+                self.assertEqual(self.run_checker(dw, lengths),
+                    [l < self.packet_min_length for l in lengths])
+

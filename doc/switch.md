@@ -96,22 +96,20 @@ host itself processes far less: it is a management port.
 
 ### Maximum frame length
 
-Measured on the simulated i9 (PHY0 -> switch -> PHY1, lengths without FCS):
+Frames up to `buffer_size` bytes (without FCS) are forwarded: 4096 bytes by default, which covers
+1518-byte and VLAN-tagged 1522-byte frames. Longer frames can't fit the ingress buffer: they are
+dropped and counted in `ingress<n>_rx_drops`. The TAP system test checks 64 to 4096-byte frames
+across the simulated i9 PHYs and the drop of a 4097-byte frame. The internal host (LiteEth UDP/IP
+stack) accepts frames up to `eth_mtu` (1530 bytes).
 
-| Frame length    | Result                                                                   |
-|-----------------|--------------------------------------------------------------------------|
-| 60 - 2047 bytes | Forwarded (covers 1518-byte and VLAN-tagged 1522-byte frames).            |
-| 2048 - 2107     | Dropped: see below.                                                      |
-| 2108 - 4095     | Forwarded.                                                               |
-| 4096 and more   | Dropped: frames don't fit the 4KiB ingress buffer (4096 also hits the issue below). |
+LiteEth's MAC RX padding checker used to size its length counter for `eth_mtu` (1530 bytes, 11
+bits), so the count wrapped and frames whose length modulo 2048 was under 60 bytes (e.g. 2048 -
+2107 bytes) were flagged as runts and dropped by the switch. The counter now saturates at the
+minimum frame length, so the runt check no longer depends on the frame length
+(`test/test_mac_padding.py`, `test/test_mac_padding_rtl.py`).
 
-The 2048 - 2107 gap comes from LiteEth's MAC RX padding checker: its length counter is sized for
-`eth_mtu` (1530 bytes, 11 bits) and wraps, flagging frames whose length modulo 2048 is under 60
-bytes as runts. Such frames reach the switch intact (no CRC errors) and are dropped by the
-ingress. The internal host (LiteEth UDP/IP stack) accepts frames up to `eth_mtu` (1530 bytes).
-
-9000-byte jumbo frames would need `buffer_size=16384` (an estimated 11 block RAMs per ingress
-instead of 3) and a wider length counter in the padding checker.
+9000-byte jumbo frames would need `buffer_size=16384`: an estimated 11 block RAMs per ingress
+instead of 3.
 
 ## Integration
 
@@ -228,6 +226,8 @@ sw1: tap1 192.168.1.101 -- PHY1 --+
 
 - RGMII in-band link status on both PHYs.
 - Ping between the namespaces, both ways, with up to 1514-byte frames.
+- Frame lengths from 64 to 4096 bytes forwarded, a 4097-byte frame dropped and counted (TAP MTUs
+  are raised to 9000 bytes; the simulation module reads up to 9018-byte frames).
 - Ping of the internal host from both namespaces, alternately.
 - MAC table contents (read over Etherbone through the switch).
 - A 400 x 1400-byte UDP burst between the namespaces: in order, intact, no drops and not flooded
@@ -241,7 +241,7 @@ Unit tests of the switch logic: `python3 -m unittest test.test_switch`.
 - No VLANs, spanning tree or flow control (pause frames are forwarded like other multicast).
 - Direct-mapped table: two active addresses hashing to the same slot evict each other, causing
   extra flooding.
-- Frames longer than 4095 bytes, and frames of 2048 - 2107 bytes, are dropped (see
+- Frames longer than `buffer_size` (4096 bytes by default) are dropped (see
   [Maximum frame length](#maximum-frame-length)).
 - Head-of-line blocking: an ingress waits for all the egress ports of its head frame. An internal
   port that stops accepting frames eventually stalls the floods towards it.

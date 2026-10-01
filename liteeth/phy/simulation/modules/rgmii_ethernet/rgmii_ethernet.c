@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 #include "error.h"
 
 #include <event2/listener.h>
@@ -157,7 +158,9 @@ static void rgmii_tap_event(int fd, short event, void *arg)
   p = malloc(sizeof(struct eth_packet_s));
   if(!p)
     return;
-  len = tapcfg_read(s->tapcfg, p->data, ETH_LEN);
+  /* Read the TAP directly: tapcfg_read() goes through a 4096-byte buffer, truncating longer
+   * frames (which would then get a valid FCS here). */
+  len = read(s->fd, p->data, ETH_LEN);
   if(len <= 0) {
     free(p);
     return;
